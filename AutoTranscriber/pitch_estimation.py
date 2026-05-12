@@ -349,3 +349,167 @@ def _peak_picking(cqt_frame: np.ndarray, freqs: np.ndarray,
                 'amplitude': float(amp / np.max(cqt_frame))
             })
     return notes
+
+
+
+# ============================================================================
+#  新方法：基于起始点的音高检测
+#  只检测每个起始点「新进入」的音，解决余音干扰问题
+# ============================================================================
+
+def _spectral_delta_filter(cqt: np.ndarray, onset_frames: np.ndarray,
+                           lookback: int = 3) -> np.ndarray:
+    """
+    对每个起始点，计算其与之前安静帧的频谱差（delta）。
+    只返回「新出现」的能量，过滤持续存在的余音。
+
+    Parameters
+    ----------
+    cqt : np.ndarray
+        CQT 频谱，形状 (n_bins, n_frames)
+    onset_frames : np.ndarray
+        起始帧索引
+    lookback : int
+        取起始前多少帧的均值作为基准（参考安静段）
+
+    Returns
+    -------
+    delta_cqt : np.ndarray
+        与 cqt 同形的 delta 频谱，只有新进入的能量非零
+    """
+    delta_cqt = np.zeros_like(cqt)
+    n_frames = cqt.shape[1]
+
+    for onset in onset_frames:
+        if onset < lookback or onset >= n_frames:
+            continue
+
+        # 取起始前 lookback 帧的平均作为基准（安静段）
+        base = np.mean(cqt[:, onset - lookback:onset], axis=1)
+        # 起始时刻的频谱
+        current = cqt[:, onset]
+        # delta = 新出现的能量
+        delta = np.maximum(0, current - base * 1.2)  # 1.2 倍容忍
+        delta_cqt[:, onset] = delta
+
+    return delta_cqt
+
+
+def estimate_pitches_onset_driven(
+    cqt: np.ndarray, freqs: np.ndarray, times: np.ndarray,
+    onset_frames: np.ndarray, onset_times: np.ndarray,
+    sr: int, hop_length: int = 512,
+    n_peaks: int = 5,
+    min_freq: float = 65.41,
+    max_freq: float = 2093.0,
+    threshold_factor: float = 0.08
+) -> list:
+    """
+    基于起始点的音高检测——只在每个起始点检测「新进入」的音。
+
+    与旧方法的核心区别：
+    1. 不是逐帧检测，而是只在起始点检测
+    2. 用频谱差（delta）替代原始频谱，排除旧音的余响
+    3. 返回结构也包含 onset_frame 信息，方便后续追踪持续时间
+
+    Parameters
+    ----------
+    cqt : np.ndarray
+        CQT 频谱 (n_bins, n_frames)
+    freqs : np.ndarray
+        每个 bin 对应的频率 (Hz)
+    times : np.ndarray
+        每帧的时间 (秒)
+    onset_frames : np.ndarray
+        起始帧索引
+    onset_times : np.ndarray
+        起始时间 (秒)
+    sr : int
+        采样率
+    hop_length : int
+        帧移
+    n_peaks : int
+        每个起始点最多检测的同时音符数
+    min_freq, max_freq : float
+        频率范围
+    threshold_factor : float
+        音高检测阈值 (相对于 delta 最大值)
+
+    Returns
+    -------
+    onset_notes : list of dict
+        每个元素对应一个检测到的起始点音符，包含:
+        {
+            'onset_frame': int,       # 起始帧索引
+            'onset_time': float,      # 起始时间（秒）
+            'pitch': int,             # MIDI 音符号
+            'frequency': float,       # 频率 (Hz)
+            'amplitude': float,       # 起始时相对幅度
+            'snr': float,             # 信噪比（新能量/旧能量）
+        }
+    """
+    n_frames = cqt.shape[1]
+
+    # 计算每个起始点的频谱差
+    delta_cqt = _spectral_delta_filter(cqt, onset_frames)
+
+    # 频率掩码
+    freq_mask = (freqs >= min_freq) & (freqs <= max_freq)
+
+    onset_notes = []
+
+    for idx, onset in enumerate(onset_frames):
+        if onset >= n_frames:
+            continue
+
+        # 用 delta 频谱做谐波减法检测新进入的音
+        delta_frame = delta_cqt[:, onset].copy()
+        original_frame = cqt[:, onset].copy()
+
+        # 先试试 delta 有没有能量，如果 delta 太弱就回退到原始频谱
+        if np.max(delta_frame) < threshold_factor * np.max(original_frame):
+            working_frame = original_frame.copy()
+            use_delta = False
+        else:
+            working_frame = delta_frame.copy()
+            use_delta = True
+
+        working_frame[~freq_mask] = 0
+
+        if np.max(working_frame) == 0:
+            continue
+
+        # 用谐波减法检测多音高
+        notes_at_onset = _harmonic_sieve(
+            working_frame, freqs,
+            n_peaks=n_peaks,
+            threshold_factor=threshold_factor
+        )
+
+        for note in notes_at_onset:
+            # 计算信噪比：新能量 / 旧能量
+            if use_delta and onset > 0:
+                base_frame = np.mean(
+                    cqt[:, max(0, onset - 3):onset], axis=1
+                )
+                # 找这个音符对应 bin 的旧能量
+                freq_diff = np.abs(freqs / note['frequency'] - 1.0)
+                match_idx = np.where(freq_diff < 0.05)[0]
+                old_energy = float(np.mean(base_frame[match_idx])) if len(match_idx) > 0 else 0.0
+                new_energy = note['amplitude']
+                snr = float(new_energy / (old_energy + 1e-10))
+            else:
+                snr = 1.0
+
+            onset_notes.append({
+                'onset_frame': int(onset),
+                'onset_time': float(onset_times[idx]),
+                'pitch': note['pitch'],
+                'frequency': note['frequency'],
+                'amplitude': note['amplitude'],
+                'snr': snr
+            })
+
+    # 按起始时间和幅度排序
+    onset_notes.sort(key=lambda n: (n['onset_time'], -n['amplitude']))
+    return onset_notes

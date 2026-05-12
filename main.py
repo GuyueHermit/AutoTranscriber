@@ -28,8 +28,11 @@ from AutoTranscriber import (
     compute_spectral_flux,
     detect_onsets,
     estimate_pitches,
+    estimate_pitches_onset_driven,
     estimate_vocal_pitch,
     track_notes,
+    track_notes_onset_driven,
+    perceptual_filter,
     write_midi,
     write_multitrack_midi,
     merge_tracks_to_piano,
@@ -73,6 +76,8 @@ def parse_args():
                         help='🎤 分离人声+伴奏再扒谱（适合歌曲）')
     parser.add_argument('--piano', action='store_true',
                         help='🎹 钢琴曲模式（优化节奏和音准，去除杂音）')
+    parser.add_argument('--perceptual', '-p', action='store_true',
+                        help='🧠 感知模式：基于起始点检测+振幅追踪+听感滤波（解决余音干扰）')
     parser.add_argument('--solo', action='store_true',
                         help='🎹 合并为单人钢琴谱（一人弹，默认四手联弹）')
     parser.add_argument('--view', action='store_true',
@@ -197,6 +202,78 @@ def transcribe_file(audio_path: str, args, label: str = None,
         before = len(notes)
         notes = _simplify_notes(notes, max_per_beat=sp)
         print(f"      {tag}精简: {before} → {len(notes)} 个音符")
+
+    return notes
+
+
+def transcribe_file_perceptual(audio_path: str, args, label: str = None) -> list:
+    """
+    [新方法] 基于起始点的感知式扒谱。
+
+    与旧方法的区别：
+    1. 只在起始点检测新进入的音（非逐帧检测）
+    2. 用振幅衰减追踪每个音的持续时间
+    3. 用感知滤波去除离群音和谐波
+    """
+    tag = f"[{label}] " if label else ""
+
+    y, sr = load_audio(audio_path, sr=args.sr)
+    y = preprocess(y, sr)
+    duration = len(y) / sr
+    print(f"      {tag}时长: {duration:.1f}秒")
+
+    hop = args.hop_length
+
+    # CQT 频谱
+    print(f"      {tag}计算 CQT 频谱...")
+    cqt, times, freqs = compute_cqt(
+        y, sr, hop_length=hop,
+        fmin=65.41, fmax=2093.0,
+        bins_per_octave=args.bins_per_octave
+    )
+
+    # 起始检测
+    print(f"      {tag}检测音符起始点...")
+    flux = compute_spectral_flux(cqt)
+    onset_frames, onset_times = detect_onsets(
+        flux, sr, hop_length=hop,
+        threshold=args.onset_threshold
+    )
+    print(f"      {tag}找到 {len(onset_frames)} 个起始点")
+
+    # 只在起始点检测新进入的音
+    print(f"      {tag}基于起始点的音高检测...")
+    onset_notes = estimate_pitches_onset_driven(
+        cqt, freqs, times,
+        onset_frames, onset_times,
+        sr, hop_length=hop,
+        n_peaks=args.n_peaks,
+        threshold_factor=args.pitch_threshold
+    )
+    print(f"      {tag}检测到 {len(onset_notes)} 个起始音")
+
+    # 追踪每个音的持续时间（振幅衰减法）
+    print(f"      {tag}追踪音符持续时间...")
+    notes = track_notes_onset_driven(
+        onset_notes, cqt, freqs, times,
+        sr, hop_length=hop,
+        decay_ratio=0.25,
+        snr_threshold=0.3
+    )
+    print(f"      {tag}追踪到 {len(notes)} 个音符")
+
+    # 感知滤波
+    print(f"      {tag}感知滤波（去离群音+谐波+噪声）...")
+    before = len(notes)
+    notes = perceptual_filter(
+        notes,
+        outlier_semitones=12,
+        min_duration=0.06,
+        harmonic_check=True,
+        max_simultaneous=6,
+        max_notes_per_beat=8
+    )
+    print(f"      {tag}滤波: {before} → {len(notes)} 个音符")
 
     return notes
 
@@ -440,8 +517,12 @@ def main():
     # 模式 B: 直接扒谱
     # =========================================================
     else:
-        print_progress("扒谱中...")
-        notes = transcribe_file(input_path, args, piano_mode=args.piano)
+        if args.perceptual:
+            print_progress("🧠 感知模式扒谱（基于起始点+振幅追踪+听感滤波）...")
+            notes = transcribe_file_perceptual(input_path, args)
+        else:
+            print_progress("扒谱中...")
+            notes = transcribe_file(input_path, args, piano_mode=args.piano)
         output_path = write_midi(notes, args.output,
                                  tempo=args.tempo, program=0)
         print(f"      ✅ MIDI 已保存: {output_path} ({len(notes)} 个音符)")
