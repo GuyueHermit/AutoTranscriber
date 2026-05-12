@@ -1,0 +1,19 @@
+# 虚拟环境
+crepe_env/
+venv/
+.env/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 生成输出的音频/MIDI/PDF 文件
+output/
+
+# 系统文件
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
