@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument('--piano', action='store_true',
                         help='🎹 钢琴曲模式（优化节奏和音准，去除杂音）')
     parser.add_argument('--perceptual', '-p', action='store_true',
-                        help='🧠 感知模式：基于起始点检测+振幅追踪+听感滤波（解决余音干扰）')
+                        help='🧠 感知模式：基于起始点检测+旋律伴奏分层+振幅追踪+听感滤波')
     parser.add_argument('--solo', action='store_true',
                         help='🎹 合并为单人钢琴谱（一人弹，默认四手联弹）')
     parser.add_argument('--view', action='store_true',
