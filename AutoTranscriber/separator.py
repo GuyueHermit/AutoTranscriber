@@ -12,8 +12,8 @@ import numpy as np
 import soundfile as sf
 
 
-# Demucs 安装在 ONN conda 环境中
-DEMUCS_PYTHON = r"C:\Users\kotsu\miniconda3\envs\ONN\python.exe"
+# Demucs 安装在 AutoTranscriber conda 环境中
+DEMUCS_PYTHON = r"C:\Users\kotsu\miniconda3\envs\AutoTranscriber\python.exe"
 
 # librosa 支持的音频格式（通过 audioread + soundfile 后端）
 SUPPORTED_FORMATS = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac',

@@ -20,8 +20,8 @@ pip install -r requirements.txt
 
 > 音源分离功能需额外安装 Demucs（已集成，自动可用）：
 > ```
-> conda create -n ONN python=3.10
-> conda activate ONN
+> conda create -n AutoTranscriber python=3.10
+> conda activate AutoTranscriber
 > pip install torch torchaudio
 > pip install demucs soundfile av
 > ```

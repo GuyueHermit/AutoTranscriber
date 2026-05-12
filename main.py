@@ -444,7 +444,7 @@ def main():
     if args.separate:
         if not has_demucs():
             print("❌ Demucs 不可用，无法分离。请先安装:")
-            print("   conda activate ONN && pip install demucs")
+            print("   conda activate AutoTranscriber && pip install demucs")
             sys.exit(1)
 
         print_progress("阶段 1/3: 音源分离 (Demucs)...")

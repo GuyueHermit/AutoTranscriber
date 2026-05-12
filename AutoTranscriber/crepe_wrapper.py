@@ -33,7 +33,7 @@ def estimate_vocal_pitch_crepe(audio_path: str,
     使用 CREPE 深度学习模型进行人声音高估计。
 
     通过子进程调用独立 Python 环境中的 torchcrepe。
-    不依赖 ONN 或其他项目的环境。
+    不依赖 AutoTranscriber 或其他项目的环境。
 
     Parameters
     ----------
