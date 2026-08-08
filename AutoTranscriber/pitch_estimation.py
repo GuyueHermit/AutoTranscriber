@@ -25,36 +25,98 @@ def midi_to_name(midi_note: int) -> str:
     return f"{note_name}{octave}"
 
 
+def _is_harmonic_of_freq(candidate_freq: float, base_freq: float,
+                         max_harmonic: int = 6,
+                         tolerance: float = 0.06) -> bool:
+    """
+    用连续频率比判断 candidate_freq 是否为 base_freq 的整数倍谐波。
+
+    相比旧版（MIDI 音高差 -> 2^(n/12) 近似频率比），直接用真实频率比值，
+    避免半音量化误差导致的误判/漏判。容差为绝对容差（~2 个 CQT bin 定位误差）。
+    """
+    if base_freq <= 0 or candidate_freq <= base_freq * 1.02:
+        return False
+    ratio = candidate_freq / base_freq
+    h = int(round(ratio))
+    if h < 2 or h > max_harmonic:
+        return False
+    return abs(ratio - h) <= tolerance
+
+
 def _is_harmonic_of(candidate_pitch: int, base_pitch: int, max_harmonic: int = 6) -> bool:
     """
-    判断 candidate_pitch 是否是 base_pitch 的谐波（八度对齐近似）。
+    判断 candidate_pitch 是否是 base_pitch 的谐波（连续频率比版本）。
 
     通过检查 candidate 频率与 base 频率的比值是否为接近整数。
     """
     if candidate_pitch <= base_pitch:
         return False
-    # MIDI 音高差 → 频率比
-    semitone_diff = candidate_pitch - base_pitch
-    freq_ratio = 2 ** (semitone_diff / 12.0)
-    # 检查是否接近整数（在 ±0.05 范围内）
-    for h in range(2, max_harmonic + 1):
-        if abs(freq_ratio - h) < 0.1:
-            return True
-    return False
+    return _is_harmonic_of_freq(
+        midi_to_hz(candidate_pitch),
+        midi_to_hz(base_pitch),
+        max_harmonic=max_harmonic
+    )
+
+
+def build_harmonic_table(freqs: np.ndarray, max_harmonic: int = 6,
+                         harmonic_tolerance: float = 0.03) -> list:
+    """
+    预计算谐波索引表：对每个 bin（作为潜在基频），给出其 1..max_harmonic 次
+    谐波命中的所有 bin 索引及先验权重（1/h，谐波能量随次数递减）。
+
+    Parameters
+    ----------
+    freqs : np.ndarray
+        每个 CQT bin 对应的频率 (Hz)
+    max_harmonic : int
+        最多考虑几次谐波
+    harmonic_tolerance : float
+        谐波匹配容差（频率相对误差）
+
+    Returns
+    -------
+    table : list of (indices, weights)
+        table[b] = (harmonic_bin_indices, harmonic_bin_weights)，
+        帧循环内直接查表，避免逐帧重复 `freqs / harm_freq` 全数组比较。
+    """
+    n_bins = len(freqs)
+    table = []
+    for b in range(n_bins):
+        f0 = freqs[b]
+        idx_map = {}  # bin -> 权重（多个谐波命中同一 bin 时取最大权重）
+        for h in range(1, max_harmonic + 1):
+            harm_freq = f0 * h
+            freq_diff = np.abs(freqs / harm_freq - 1.0)
+            match_idx = np.where(freq_diff < harmonic_tolerance)[0]
+            w = 1.0 / h
+            for m in match_idx:
+                if w > idx_map.get(int(m), 0.0):
+                    idx_map[int(m)] = w
+        indices = np.array(sorted(idx_map.keys()), dtype=int)
+        weights = np.array([idx_map[i] for i in indices], dtype=float)
+        table.append((indices, weights))
+    return table
 
 
 def _harmonic_sieve(cqt_frame: np.ndarray, freqs: np.ndarray,
                     n_peaks: int = 6, threshold_factor: float = 0.05,
                     harmonic_tolerance: float = 0.03,
-                    max_harmonic: int = 6) -> list:
+                    max_harmonic: int = 6,
+                    harmonic_table: list = None,
+                    top_candidates: int = 16,
+                    suppress_ratio: float = None) -> list:
     """
-    迭代谐波减法多音高估计（改进版）。
+    谐波模板 + NNLS 非负最小二乘多音高估计（改进版）。
 
-    专为和弦设计，核心流程：
-    1. 在频谱中找到最强峰值作为候选基频
-    2. **严格减去**该基频的所有谐波成分能量
-    3. 检查候选音符是否为已检测音符的谐波 → 跳过
-    4. 重复直到提取足够音符或能量耗尽
+    相比旧版「迭代谐波减法」（固定 0.9/h 比例减去、逐帧 argmax 贪心），
+    本版本：
+    1. **并行候选评估** — 每帧取 Top-K 局部峰值作为候选基频，同时求解，
+       不再贪心先到先得（两个共享谐波的基频会分摊能量而非互相压制）
+    2. **NNLS 模板拟合** — 为每个候选建立谐波模板（1/h 能量先验），
+       用非负最小二乘同时估计所有候选强度，适配真实乐器谐波分布
+    3. **预计算查表** — harmonic_table 一次构建，帧循环内直接查表，
+       不再逐帧重复 `freqs / harm_freq` 全数组比较
+    4. **连续频率比谐波抑制** — 用真实频率比值判断整数倍关系
 
     Parameters
     ----------
@@ -65,98 +127,118 @@ def _harmonic_sieve(cqt_frame: np.ndarray, freqs: np.ndarray,
     n_peaks : int
         每帧最大同时音符数
     threshold_factor : float
-        幅度阈值
+        强度阈值（相对 NNLS 最大拟合强度）
     harmonic_tolerance : float
         谐波匹配容差
     max_harmonic : int
-        最多减去多少次谐波
+        最多考虑多少次谐波
+    harmonic_table : list, optional
+        build_harmonic_table 的预计算结果；None 则内部惰性构建
+    top_candidates : int
+        每帧局部峰值候选数（参与 NNLS 求解的上限）
+    suppress_ratio : float, optional
+        显式谐波抑制比例（默认 None = 信任 NNLS 能量分摊，不做显式抑制；
+        NNLS 模板拟合已天然把基频的泛音能量归入基频，谐波候选的剩余
+        系数即其独立音符证据）。若传入数值，则仅当低音候选强度 >=
+        suppress_ratio * 高音候选强度时才抑制（1.0 = 无条件抑制，
+        相当于旧版行为）。
 
     Returns
     -------
     notes : list of dict
         [{'pitch': int, 'amplitude': float, 'frequency': float}, ...]
     """
-    residual = cqt_frame.copy().astype(np.float64)
-    original_max = np.max(cqt_frame) if np.max(cqt_frame) > 0 else 1.0
-    threshold = threshold_factor * original_max
+    from scipy.optimize import nnls
 
-    detected_notes = []
+    frame = cqt_frame.astype(np.float64)
+    original_max = np.max(frame) if np.max(frame) > 0 else 1.0
+
+    if harmonic_table is None:
+        harmonic_table = build_harmonic_table(
+            freqs, max_harmonic, harmonic_tolerance)
+
+    # ---- 1. 候选基频：局部峰值 Top-K（并行评估，非贪心） ----
+    kernel = maximum_filter(frame, size=5, mode='constant')
+    is_peak = (frame == kernel) & (frame > 0)
+    peak_bins = np.where(is_peak)[0]
+    if len(peak_bins) == 0:
+        return []
+
+    peak_amps = frame[peak_bins]
+    # 过滤基频 bin 自身能量过低的峰值：避免 NNLS 的 missing-fundamental
+    # 效应（低频幽灵候选通过高次谐波解释其他基频的能量）
+    min_peak = threshold_factor * original_max
+    valid = peak_amps >= min_peak
+    peak_bins = peak_bins[valid]
+    peak_amps = peak_amps[valid]
+    if len(peak_bins) == 0:
+        return []
+
+    top_idx = np.argsort(peak_amps)[::-1][:top_candidates]
+    candidates = peak_bins[top_idx]
+
+    # ---- 2. NNLS 模板拟合 ----
+    n_bins = len(frame)
+    n_cand = len(candidates)
+    template = np.zeros((n_bins, n_cand))
+    for j, b in enumerate(candidates):
+        idxs, wts = harmonic_table[b]
+        template[idxs, j] = wts
+
+    # 丢弃模板为空的候选（谐波全落在频率范围外）
+    active = np.where(template.max(axis=0) > 0)[0]
+    if len(active) == 0:
+        return []
+    template = template[:, active]
+    candidates = candidates[active]
+
+    strengths, _ = nnls(template, frame)
+
+    # ---- 3. 谐波抑制（默认 None = 信任 NNLS 分摊；显式抑制仅作可选开关） ----
     min_freq = 65.41
     max_freq = 2093.0
+    kept = []  # (bin, freq, strength)
 
-    for iteration in range(n_peaks * 2):  # 多试几次以防中途跳过
-        if len(detected_notes) >= n_peaks:
-            break
-
-        peak_bin = np.argmax(residual)
-        peak_amp = residual[peak_bin]
-        peak_freq = freqs[peak_bin]
-
-        if peak_amp < threshold:
-            break
-        if peak_freq < min_freq or peak_freq > max_freq:
-            residual[peak_bin] = 0
+    order = np.argsort(strengths)[::-1]
+    for j in order:
+        s = strengths[j]
+        if s <= 0:
+            continue
+        freq_c = freqs[candidates[j]]
+        if freq_c < min_freq or freq_c > max_freq:
             continue
 
-        midi_note = hz_to_midi(peak_freq)
+        if suppress_ratio is not None:
+            is_harm = False
+            for (_, freq_k, s_k) in kept:
+                if _is_harmonic_of_freq(freq_c, freq_k, max_harmonic):
+                    if s_k >= suppress_ratio * s:
+                        is_harm = True
+                        break
+            if is_harm:
+                continue
+
+        kept.append((int(candidates[j]), float(freq_c), float(s)))
+        if len(kept) >= n_peaks:
+            break
+
+    # ---- 4. 阈值过滤 + 输出 ----
+    max_strength = max(strengths) if len(strengths) > 0 else 0.0
+    threshold = threshold_factor * max_strength if max_strength > 0 else 0.0
+
+    detected_notes = []
+    for b, f, s in kept:
+        if s < threshold:
+            continue
+        midi_note = hz_to_midi(f)
         if midi_note < 12 or midi_note > 127:
-            residual[peak_bin] = 0
             continue
-
-        # ---- 检查是否为已检测音符的谐波 ----
-        is_harmonic = False
-        for prev in detected_notes:
-            if _is_harmonic_of(midi_note, prev['pitch'], max_harmonic=6):
-                # 是该音符的谐波 → 把这一带能量彻底清空不纳入检测
-                bin_range = max(3, int(len(freqs) * 0.008))
-                start = max(0, peak_bin - bin_range)
-                end = min(len(residual), peak_bin + bin_range)
-                residual[start:end] = 0
-                is_harmonic = True
-                break
-
-        if is_harmonic:
-            continue
-
-        # ---- 检查是否与已检测音符同音高（八度重复） ----
-        is_duplicate = False
-        for prev in detected_notes:
-            if midi_note == prev['pitch']:
-                is_duplicate = True
-                break
-        if is_duplicate:
-            residual[peak_bin] = 0
-            continue
-
-        # ---- 检测到新的音符基频 ----
         detected_notes.append({
             'pitch': midi_note,
-            'frequency': float(peak_freq),
-            'amplitude': float(peak_amp / original_max)
+            'frequency': f,
+            'amplitude': float(s / original_max)
         })
 
-        # ---- 谐波减法：能量从残差中彻底减去 ----
-        for h in range(1, max_harmonic + 1):
-            harm_freq = peak_freq * h
-            if harm_freq > max_freq * 1.5:
-                break
-
-            # 找到谐波附近的 bin
-            freq_diff = np.abs(freqs / harm_freq - 1.0)
-            match_idx = np.where(freq_diff < harmonic_tolerance)[0]
-
-            for idx in match_idx:
-                # 根据检测到的幅度，按比例减去
-                subtraction = peak_amp * min(1.0, (0.9 / h))
-                residual[idx] = max(0, residual[idx] - subtraction)
-
-        # 清空峰值周围
-        bin_range = max(3, int(len(freqs) * 0.008))
-        start = max(0, peak_bin - bin_range)
-        end = min(len(residual), peak_bin + bin_range)
-        residual[start:end] = 0
-
-    # 按幅度排序
     detected_notes.sort(key=lambda n: n['amplitude'], reverse=True)
     return detected_notes
 
@@ -301,6 +383,11 @@ def estimate_pitches(cqt: np.ndarray, freqs: np.ndarray,
 
     freq_mask = (freqs >= min_freq) & (freqs <= max_freq)
 
+    # 预计算谐波索引表一次，帧循环内查表（大幅减少重复频率比较）
+    harmonic_table = None
+    if use_harmonic_sieve:
+        harmonic_table = build_harmonic_table(freqs)
+
     for t in range(n_frames):
         frame = cqt[:, t].copy()
         frame[~freq_mask] = 0
@@ -313,7 +400,8 @@ def estimate_pitches(cqt: np.ndarray, freqs: np.ndarray,
             notes = _harmonic_sieve(
                 frame, freqs,
                 n_peaks=n_peaks,
-                threshold_factor=threshold_factor
+                threshold_factor=threshold_factor,
+                harmonic_table=harmonic_table
             )
         else:
             notes = _peak_picking(
@@ -450,6 +538,9 @@ def estimate_pitches_onset_driven(
     """
     n_frames = cqt.shape[1]
 
+    # 预计算谐波索引表一次（起始点循环内查表）
+    harmonic_table = build_harmonic_table(freqs)
+
     # 计算每个起始点的频谱差
     delta_cqt = _spectral_delta_filter(cqt, onset_frames)
 
@@ -479,11 +570,12 @@ def estimate_pitches_onset_driven(
         if np.max(working_frame) == 0:
             continue
 
-        # 用谐波减法检测多音高
+        # 用谐波模板 + NNLS 检测多音高（查预计算表）
         notes_at_onset = _harmonic_sieve(
             working_frame, freqs,
             n_peaks=n_peaks,
-            threshold_factor=threshold_factor
+            threshold_factor=threshold_factor,
+            harmonic_table=harmonic_table
         )
 
         for note in notes_at_onset:
