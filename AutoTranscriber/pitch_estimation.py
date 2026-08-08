@@ -275,6 +275,7 @@ def estimate_vocal_pitch(y: np.ndarray, sr: int,
         [{'start': float, 'end': float, 'pitch': int, 'velocity': int}, ...]
     """
     import librosa
+    from scipy.signal import medfilt
 
     # pYIN 音高估计
     f0, voiced_flag, voiced_prob = librosa.pyin(
@@ -286,17 +287,40 @@ def estimate_vocal_pitch(y: np.ndarray, sr: int,
         fill_na=0.0
     )
 
-    # 将频率转为 MIDI 音符号
-    # 只保留 voiced 且概率 > 0.3 的帧
+    # ---- 概率阈值 + 中值滤波平滑（HMM 平滑的轻量替代） ----
+    # 1) voiced 状态序列中值滤波：消除单帧孤立跳变（颤音/呼吸噪声）
+    # 2) f0 序列中值滤波：平滑抖动的音高轨迹
     threshold = 0.3
+    voiced = (voiced_flag > 0) & (voiced_prob > threshold) & (f0 > 0)
+    voiced = medfilt(voiced.astype(int), kernel_size=5).astype(bool)
+
+    f0_smooth = f0.copy()
+    voiced_idx = np.where(voiced)[0]
+    if len(voiced_idx) > 0:
+        f0_smooth[voiced_idx] = medfilt(f0[voiced_idx], kernel_size=5)
+
+    # 将频率转为 MIDI 音符号
     midi_notes = np.zeros_like(f0, dtype=int)
-    for i, (f, v) in enumerate(zip(f0, voiced_flag)):
-        if v and f > 0 and voiced_prob[i] > threshold:
-            midi = int(round(12 * np.log2(f / 440.0) + 69))
+    for i in range(len(f0)):
+        if voiced[i]:
+            midi = int(round(12 * np.log2(f0_smooth[i] / 440.0) + 69))
             if 0 < midi < 128:
                 midi_notes[i] = midi
-        else:
-            midi_notes[i] = 0
+
+    # ---- 帧能量包络（用于动态力度映射） ----
+    frame_rms = librosa.feature.rms(y=y, frame_length=2048,
+                                    hop_length=hop_length)[0]
+    if frame_rms.size < len(midi_notes):
+        frame_rms = np.pad(frame_rms, (0, len(midi_notes) - frame_rms.size))
+    rms_ref = float(np.percentile(frame_rms[frame_rms > 0], 95)) \
+        if np.any(frame_rms > 0) else 1.0
+    rms_ref = max(rms_ref, 1e-8)
+
+    def _vel_from_energy(start_idx: int, end_idx: int) -> int:
+        """将音符段平均能量映射到 MIDI 力度 (1~127)"""
+        seg = frame_rms[start_idx:end_idx]
+        e = float(np.mean(seg)) if len(seg) > 0 else 0.0
+        return min(127, max(1, int(40 + 80 * min(1.0, e / rms_ref))))
 
     # ---- 将连续帧合并为音符事件 ----
     times = librosa.frames_to_time(
@@ -326,7 +350,7 @@ def estimate_vocal_pitch(y: np.ndarray, sr: int,
                         'start': float(times[cur_start]),
                         'end': float(times[i]),
                         'pitch': int(cur_pitch),
-                        'velocity': 80
+                        'velocity': _vel_from_energy(cur_start, i)
                     })
                 # 开始新音符
                 cur_pitch = pitch
@@ -340,7 +364,7 @@ def estimate_vocal_pitch(y: np.ndarray, sr: int,
                         'start': float(times[cur_start]),
                         'end': float(times[i]),
                         'pitch': int(cur_pitch),
-                        'velocity': 80
+                        'velocity': _vel_from_energy(cur_start, i)
                     })
                 cur_pitch = 0
                 cur_count = 0
@@ -351,7 +375,7 @@ def estimate_vocal_pitch(y: np.ndarray, sr: int,
             'start': float(times[cur_start]),
             'end': float(times[-1]),
             'pitch': int(cur_pitch),
-            'velocity': 80
+            'velocity': _vel_from_energy(cur_start, len(midi_notes))
         })
 
     return notes

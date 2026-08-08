@@ -65,7 +65,9 @@ def track_notes_onset_driven(
     min_note_frames: int = 2,
     max_note_seconds: float = 4.0,
     velocity_scale: float = 80.0,
-    snr_threshold: float = 0.5
+    snr_threshold: float = 0.5,
+    track_semitones: float = 1.0,
+    max_drift_semitones: float = 3.0
 ) -> list:
     """
     基于起始点的音符追踪。
@@ -145,24 +147,25 @@ def track_notes_onset_driven(
                     'velocity': velocity
                 })
 
-        # ---- 向前追踪当前音的振幅衰减 ----
-        # 找到该音高在 CQT 中的频带范围
+        # ---- 向前追踪当前音的振幅衰减（频率轨迹跟随） ----
+        # 找到该音高在 CQT 中的起始频带（±1 半音）
         freq = midi_to_hz(pitch)
-        # 半音带宽 (±1 半音)
-        freq_low = midi_to_hz(pitch - 1)
-        freq_high = midi_to_hz(pitch + 1)
-        band_mask = (freqs >= freq_low) & (freqs <= freq_high)
+        band_mask = (freqs >= freq * 2 ** (-1 / 12)) & (freqs <= freq * 2 ** (1 / 12))
         band_indices = np.where(band_mask)[0]
 
         if len(band_indices) == 0:
             continue
 
-        # 起始振幅 = 该频带在起始帧的最大能量
-        start_amp_frame = float(np.max(cqt[band_indices, onset_frame]))
+        # 起始振幅 = 该频带在起始帧的最大能量；起始精确频率作为轨迹起点
+        peak_pos = int(np.argmax(cqt[band_indices, onset_frame]))
+        start_amp_frame = float(cqt[band_indices[peak_pos], onset_frame])
         if start_amp_frame == 0:
             continue
+        track_freq = float(freqs[band_indices[peak_pos]])
 
-        # 从起始帧开始向前追踪
+        # 从起始帧开始逐帧追踪：在上一帧频率 ±track_semitones 的滑动
+        # 窗口内找当前帧最大能量，轨迹随颤音（vibrato）滑动，
+        # 避免固定频带在音高漂移时误判衰减。
         end_frame = onset_frame
         below_threshold_count = 0
 
@@ -170,8 +173,20 @@ def track_notes_onset_driven(
                             onset_frame + int(max_note_seconds * sr / hop_length))
 
         for t in range(onset_frame + 1, max_end_frame + 1):
-            # 该频带在当前帧的最高能量
-            current_amp = float(np.max(cqt[band_indices, t]))
+            # 滑动搜索窗（跟随上一帧轨迹频率）
+            f_low = track_freq * 2 ** (-track_semitones / 12.0)
+            f_high = track_freq * 2 ** (track_semitones / 12.0)
+            win_mask = (freqs >= f_low) & (freqs <= f_high)
+            win_idx = np.where(win_mask)[0]
+            if len(win_idx) == 0:
+                break
+            peak_pos = int(np.argmax(cqt[win_idx, t]))
+            current_amp = float(cqt[win_idx[peak_pos], t])
+            track_freq = float(freqs[win_idx[peak_pos]])
+
+            # 漂移保护：轨迹偏离起始音高过多则停止（防止锁到其他音符）
+            if abs(12 * np.log2(track_freq / freq)) > max_drift_semitones:
+                break
 
             # 如果振幅 > decay_ratio × 起始振幅，认为还在响
             if current_amp > decay_ratio * start_amp_frame:
