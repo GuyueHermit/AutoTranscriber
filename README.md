@@ -52,7 +52,7 @@ python main.py -i 歌曲.mp3 -o 人声旋律.mid --separate --track vocals --n_p
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `-i` | 输入音频路径（wav/mp3/flac 等） | 必填 |
-| `-o` | 输出 MIDI 路径 | `output.mid` |
+| `-o` | 输出 MIDI 路径 | `输入文件同目录同名 .mid` |
 | `--separate` / `-s` | 开启音源分离模式 | 关 |
 | `--track` | 分离模式扒哪一轨：`both`/`vocals`/`accompaniment` | `both` |
 | `--demucs_model` | Demucs 分离模型 | `htdemucs` |
